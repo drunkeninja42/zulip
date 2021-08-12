@@ -190,6 +190,7 @@ from zerver.lib.user_groups import (
     access_user_group_by_id,
     create_system_user_groups_for_realm,
     create_user_group,
+    get_system_user_group_for_user,
 )
 from zerver.lib.user_mutes import add_user_mute, get_muting_users, get_user_mutes
 from zerver.lib.user_status import update_user_status
@@ -746,9 +747,27 @@ def do_create_user(
         if settings.BILLING_ENABLED:
             update_license_ledger_if_needed(user_profile.realm, event_time)
 
+        system_user_group = get_system_user_group_for_user(user_profile)
+        UserGroupMembership.objects.create(user_profile=user_profile, user_group=system_user_group)
+
+        if user_profile.role == UserProfile.ROLE_MEMBER and not user_profile.is_provisional_member:
+            full_members_system_group = UserGroup.objects.get(
+                name="@role:fullmembers", realm=user_profile.realm, is_system_group=True
+            )
+            UserGroupMembership.objects.create(
+                user_profile=user_profile, user_group=full_members_system_group
+            )
+
     # Note that for bots, the caller will send an additional event
     # with bot-specific info like services.
     notify_created_user(user_profile)
+
+    do_send_user_group_members_update_event("add_members", system_user_group, [user_profile.id])
+    if user_profile.role == UserProfile.ROLE_MEMBER and not user_profile.is_provisional_member:
+        do_send_user_group_members_update_event(
+            "add_members", full_members_system_group, [user_profile.id]
+        )
+
     if bot_type is None:
         process_new_human_user(
             user_profile,
@@ -868,6 +887,40 @@ def do_reactivate_user(user_profile: UserProfile, *, acting_user: Optional[UserP
 
 def active_humans_in_realm(realm: Realm) -> Sequence[UserProfile]:
     return UserProfile.objects.filter(realm=realm, is_active=True, is_bot=False)
+
+
+@transaction.atomic(savepoint=False)
+def update_users_in_full_members_system_group(
+    realm: Realm, affected_user_ids: Sequence[int] = []
+) -> None:
+    full_members_system_group = UserGroup.objects.get(
+        realm=realm, name="@role:fullmembers", is_system_group=True
+    )
+    members_system_group = UserGroup.objects.get(
+        realm=realm, name="@role:members", is_system_group=True
+    )
+
+    full_member_group_users = set(
+        full_members_system_group.direct_members.filter(id__in=affected_user_ids)
+    )
+    member_group_users = set(members_system_group.direct_members.filter(id__in=affected_user_ids))
+
+    old_full_members = [
+        user
+        for user in full_member_group_users
+        if user.is_provisional_member or user.role != UserProfile.ROLE_MEMBER
+    ]
+
+    members_excluding_full_members = list(member_group_users - full_member_group_users)
+    new_full_members = [
+        user for user in members_excluding_full_members if not user.is_provisional_member
+    ]
+
+    if len(old_full_members) > 0:
+        remove_members_from_user_group(full_members_system_group, old_full_members)
+
+    if len(new_full_members) > 0:
+        bulk_add_members_to_user_group(full_members_system_group, new_full_members)
 
 
 @transaction.atomic(savepoint=False)
@@ -5018,6 +5071,8 @@ def do_change_user_role(
     user_profile: UserProfile, value: int, *, acting_user: Optional[UserProfile]
 ) -> None:
     old_value = user_profile.role
+    old_system_group = get_system_user_group_for_user(user_profile)
+
     user_profile.role = value
     user_profile.save(update_fields=["role"])
     RealmAuditLog.objects.create(
@@ -5040,6 +5095,20 @@ def do_change_user_role(
     transaction.on_commit(
         lambda: send_event(user_profile.realm, event, active_user_ids(user_profile.realm_id))
     )
+
+    UserGroupMembership.objects.filter(
+        user_profile=user_profile, user_group=old_system_group
+    ).delete()
+
+    system_group = get_system_user_group_for_user(user_profile)
+    UserGroupMembership.objects.create(user_profile=user_profile, user_group=system_group)
+
+    do_send_user_group_members_update_event("remove_members", old_system_group, [user_profile.id])
+
+    do_send_user_group_members_update_event("add_members", system_group, [user_profile.id])
+
+    if UserProfile.ROLE_MEMBER in [old_value, value]:
+        update_users_in_full_members_system_group(user_profile.realm, [user_profile.id])
 
 
 def do_make_user_billing_admin(user_profile: UserProfile) -> None:
