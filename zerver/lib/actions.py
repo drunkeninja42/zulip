@@ -900,10 +900,19 @@ def update_users_in_full_members_system_group(
         realm=realm, name="@role:members", is_system_group=True
     )
 
-    full_member_group_users = set(
-        full_members_system_group.direct_members.filter(id__in=affected_user_ids)
-    )
-    member_group_users = set(members_system_group.direct_members.filter(id__in=affected_user_ids))
+    full_member_group_users: Set[UserProfile] = set()
+    member_group_users: Set[UserProfile] = set()
+
+    if affected_user_ids:
+        full_member_group_users = set(
+            full_members_system_group.direct_members.filter(id__in=affected_user_ids)
+        )
+        member_group_users = set(
+            members_system_group.direct_members.filter(id__in=affected_user_ids)
+        )
+    else:
+        full_member_group_users = set(full_members_system_group.direct_members.all())
+        member_group_users = set(members_system_group.direct_members.all())
 
     old_full_members = [
         user
@@ -981,6 +990,9 @@ def do_set_realm_property(
             )
             # TODO: Design a bulk event for this or force-reload all clients
             send_user_email_update_event(user_profile)
+
+    if name == "waiting_period_threshold":
+        update_users_in_full_members_system_group(realm)
 
 
 def do_set_realm_authentication_methods(
